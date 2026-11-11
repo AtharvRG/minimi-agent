@@ -31,7 +31,16 @@ yarn-error.log*
 .pnpm-debug.log*
 
 # env files (can opt-in for committing if needed)
-.env*
+.env
+.env*.local
+
+# local runtime SQLite database & WAL files
+/data/*.db
+/data/*.db-shm
+/data/*.db-wal
+
+# local cached HuggingFace ONNX models (auto-downloaded at runtime)
+/.models/
 
 # vercel
 .vercel
