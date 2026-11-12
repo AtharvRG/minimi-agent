@@ -77,5 +77,7 @@ class NimRateLimitedPool {
 }
 
 export const nimPool = new NimRateLimitedPool();
+export const FALLBACK_NIM_MODEL =
+  "nvidia/llama-3.3-nemotron-super-49b-v1";
 export const DEFAULT_NIM_MODEL =
-  process.env.NVIDIA_MODEL || "meta/llama-3.3-70b-instruct";
+  process.env.NVIDIA_MODEL || FALLBACK_NIM_MODEL;
