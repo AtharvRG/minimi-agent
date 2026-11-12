@@ -1,28 +1,28 @@
-# minimi Chat Agent — Architecture & Design (`DESIGN.md`)
+# minimi Chat Agent - Architecture & Design (`DESIGN.md`)
 
-## 1. The Core Insight: Why Standard Web-Search Agents Fail This Dataset
+## 1. The Core Insight: Why Standard Web-Search Wrappers Fail This Dataset
 
-Inspecting the evaluation dataset reveals a subtle architectural challenge:
+Inspecting the evaluation dataset reveals a multi-part architectural problem disguised as a simple prompt:
 
-- *"On Monday we shortlisted 5 CRM tools for a 20-person sales team. Has any of them changed pricing or shipped something big since?"*
+- *"On Monday I shortlisted 5 CRM tools for a 20-person sales team. Has any of them changed pricing or shipped something big since?"*
 - *"What did I ask you on 3 November? Is your answer still correct today?"*
 - *"Last Tuesday I asked you about Postgres hosting. Has any pricing changed since then?"*
 
 A naive LLM wrapper with a `web_search` tool fails these prompts for three reasons:
 
-1. **The Single-Tool Constraint vs. Past Context**: The specification states the agent has **one tool: `web_search`**. Therefore, episodic memory cannot be exposed as a second `search_memory` tool; historical context must be resolved deterministically *before* the model's tool-calling loop.
-2. **Why Pure Vector RAG Fails Temporal Queries**: The cosine similarity between *"What did I ask you on 3 November?"* and the actual question asked on Nov 3 (*"What is the latest stable version of Next.js..."*) is near zero.
-3. **Temporal Snapshot Diffing**: Live web search only tells the agent what a price is *today*. To answer *"Has any pricing changed since Last Tuesday?"*, the agent must compare Tuesday's stored baseline snapshot against today's live pricing page.
+1. **The Single-Tool Constraint vs. Episodic Recall**: The specification mandates **one tool: `web_search`**. Exposing a second `search_memory` tool violates the constraint and wastes an extra LLM round-trip. Historical context must be resolved deterministically *before* the tool-calling loop begins.
+2. **Why Pure Vector RAG Fails Temporal Queries**: The semantic cosine similarity between *"What did I ask you on 3 November?"* and the actual question asked on Nov 3 (*"What is the latest stable version of Next.js..."*) is near zero.
+3. **Temporal Snapshot Diffing**: Live web search only reveals what a price is *today*. Answering *"Has any pricing changed since Last Tuesday?"* requires retrieving Tuesday's stored baseline and diffing it against today's live pricing page.
 
 ---
 
 ## 2. How It Works (System Architecture)
 
 ```text
-User Prompt ──► [1. 3-Layer Hybrid Memory Engine (SQLite, ~15ms, 0 API calls)]
-                    ├─ Layer 1: Temporal Parser (chrono-node → ISO date window)
+User Prompt ──► [1. 3-Layer Hybrid Memory Pre-Processor (SQLite WAL, ~15ms, 0 API calls)]
+                    ├─ Layer 1: Temporal Index (chrono-node → ISO date window)
                     ├─ Layer 2: Lexical Index (SQLite FTS5 BM25 keyword match)
-                    └─ Layer 3: Semantic Index (Local IBM Granite-R2 ONNX 384-d vectors)
+                    └─ Layer 3: Semantic Index (Local quantized IBM Granite-R2 ONNX 384-d vectors)
                             │
                             ▼
                 [2. Temporal Context Injection (<episodic_memory> in System Prompt)]
@@ -33,43 +33,54 @@ User Prompt ──► [1. 3-Layer Hybrid Memory Engine (SQLite, ~15ms, 0 API cal
                     Tool Call: `web_search({ queries: string[] })` (Parallel Fan-Out)
                             │
                             ▼
-                [4. Dual-Tier Search & Markdown Extraction Engine]
-                    ├─ Tier 1: Tavily AI Search API (if TAVILY_API_KEY is present)
-                    └─ Tier 2: Zero-Key SiftWeb Pipeline (DuckDuckGo + Linkedom + Readability + Turndown)
+                [4. Dual-Tier Search & Markdown Extraction Pipeline]
+                    ├─ Tier 1: Tavily AI Search API (if TAVILY_API_KEY is configured)
+                    └─ Tier 2: Zero-Key SiftWeb Fallback (DuckDuckGo + Linkedom + Readability + Turndown)
+                            │
+                            ▼
+                [5. Inline Cognitive Memory Gate + Semantic Upsert Consolidation]
+                    ├─ Filters out ephemeral chitchat (<memory_gate> JSON evaluation in 0 extra API calls)
+                    └─ Deduplicates repeated/paraphrased queries (cosine + token overlap >= 0.82) in-place
 ```
 
 ### A. 3-Layer Hybrid Episodic Memory (`src/lib/memory.ts` & `src/lib/embedder.ts`)
 
-Every turn (plus extracted sources and timestamps) is persisted in a local **SQLite (`WAL` mode)** database. Before calling the LLM, a fast pre-processor scores past turns across three orthogonal signals:
+Before calling the LLM, a deterministic pre-processor scores historical turns stored in local SQLite (`data/agent.db`) across three orthogonal signals:
 
-1. **Temporal Layer (`chrono-node`)**: Parses relative and absolute time expressions (*"On Monday"*, *"3 November"*, *"Last Tuesday"*) relative to the reference clock and queries SQLite's `idx_messages_created_at` B-tree index (`+10.0` weight).
-2. **Lexical Layer (SQLite FTS5)**: Runs BM25 keyword matching on domain terms (*"CRM"*, *"Postgres"*) (`+4.0` weight).
-3. **Semantic Layer (Local IBM Granite R2 ONNX)**: Runs `onnx-community/granite-embedding-small-english-r2-ONNX` (`q8` quantized) locally on CPU in ~12ms via `@huggingface/transformers`. This uses **0 external API calls** and preserves our LLM rate limit.
+1. **Temporal Layer (`chrono-node`)**: Parses relative and absolute dates (*"On Monday"*, *"3 November"*, *"Last Tuesday"*) relative to the active reference clock and queries SQLite's `idx_messages_created_at` B-tree index (`+10.0` weight).
+2. **Lexical Layer (SQLite FTS5)**: Executes BM25 keyword matching on domain entities (*"CRM"*, *"Postgres"*) (`+4.0` weight).
+3. **Semantic Layer (Local IBM Granite R2 ONNX)**: Runs `onnx-community/granite-embedding-small-english-r2-ONNX` (`q8` quantized, 384-dim) locally on CPU in ~12ms via `@huggingface/transformers`—consuming **0 external API calls** and **0 NIM rate-limit quota**.
 
-### B. Parallel Fan-Out `web_search` with Dual-Tier Fallback (`src/lib/search-tool.ts`)
+### B. Autonomous Cognitive Memory Gate & Semantic Deduplication (`consolidateOrSaveTurn`)
 
-- **Single-Roundtrip Fan-Out**: Instead of taking `query: string` and forcing 5 sequential LLM turns to check 5 CRM tools, `web_search` accepts `queries: string[]`. All sub-queries execute concurrently via `Promise.all()`, cutting multi-entity research latency from ~18s down to ~2s.
-- **Tier 1 (Tavily API) → Tier 2 (Zero-Key Local Scraper)**: If `TAVILY_API_KEY` is configured, it is used first. If omitted or rate-limited, the agent degrades gracefully to a zero-key pipeline (`duck-duck-scrape` + parallel HTML fetch + `@mozilla/readability` + `turndown` HTML-to-Markdown conversion) so `npm run dev` works out-of-the-box with only an LLM key.
+Blindly saving every turn pollutes long-term memory with greetings (*"hey"*, *"thanks"*) or duplicate verification queries.
 
-### C. NVIDIA NIM 38-RPM Sliding-Window Guard (`src/lib/nim-client.ts`)
+- **Zero-RPM Inline Memory Gate**: The model appends a structured `<memory_gate>` decision block at the end of its final response (`should_store`, `category`, `reason`). The server strips this block before rendering and skips persisting ephemeral turns without needing a second LLM call.
+- **Semantic Upsert Consolidation**: When `should_store: true`, the engine compares the new prompt's Granite-R2 vector and token overlap against prior user turns on the same date window. If similarity `>= 0.82` (e.g., a repeated or reworded prompt), it **consolidates (upserts) the existing User + Assistant pair in-place** rather than appending duplicate rows, while protecting historical baseline seeds on past dates.
 
-NVIDIA NIM enforces a strict **40 RPM** rate limit. We implemented a stateful sliding-window token bucket capped at **38 RPM per key** with automatic round-robin key rotation (`NVIDIA_API_KEYS=key1,key2`). If all keys hit 38 requests within a rolling 60s window, requests queue in-memory until the oldest timestamp expires—eliminating `HTTP 429` crashes during multi-step tool execution.
+### C. Parallel Fan-Out `web_search` with Dual-Tier Fallback (`src/lib/search-tool.ts`)
+
+- **Single-Roundtrip Fan-Out**: `web_search` accepts `queries: string[]` (up to 5 concurrent sub-queries). Checking 5 CRM tools executes in parallel via `Promise.all()`, cutting multi-entity research latency from ~18s down to ~2s and saving 4 LLM round-trips.
+- **Zero-Key Resilience**: Uses Tavily API when `TAVILY_API_KEY` is present, and automatically falls back to a zero-key local scraper (`duck-duck-scrape` + parallel HTML fetch + `@mozilla/readability` + `turndown` Markdown conversion) so `npm run dev` works out-of-the-box with only an LLM key.
+
+### D. NVIDIA NIM 38-RPM Sliding-Window Guard (`src/lib/nim-client.ts`)
+
+NVIDIA NIM enforces a strict **40 RPM** limit. Our client pool tracks request timestamps in a 60-second sliding window capped at **38 RPM per key**, rotating across comma-separated keys (`NVIDIA_API_KEYS`) or queuing briefly in-memory so multi-step tool loops never crash with `HTTP 429`.
+
+---
+
+## 3. What I Considered and Rejected
+
+1. **Exposing a Second `search_memory` or `save_memory` Tool (Rejected)**: Violates the single-tool rule (`web_search` only) and costs 1–2 extra LLM round-trips per turn (+2s latency and +2 RPM). Pre-processing retrieval and piggybacking `<memory_gate>` on the final response achieves full episodic memory in **0 extra API calls**.
+2. **Cloud Embedding APIs for Memory (Rejected)**: Calling remote embedding endpoints on every turn burns rate-limit quota and adds network latency. Local quantized **IBM Granite R2 ONNX** runs in ~12ms on CPU with <150MB RAM.
+3. **Appending Every Verification Turn to SQLite (Rejected)**: Repeatedly clicking or rephrasing a benchmark prompt floods the database with near-identical rows. Semantic upsert consolidation keeps memory high-signal and compact.
+4. **Heavy Agent Frameworks like LangChain (Rejected)**: Opaque abstractions obscure prompt assembly and streaming telemetry. A ~150-line native TypeScript loop over the OpenAI-compatible SDK streams granular NDJSON events (`memory` → `reasoning` → `search_start` → `search_complete` → `memory_gate` → `answer`) to the UI's `ChainOfThought`, scrollable `Reasoning`, and Portal-rendered `InlineCitation` components.
 
 ---
 
-## 3. What We Considered and Rejected
+## 4. What I Would Build With Another Week
 
-1. **Exposing a Second `search_history` Tool to the LLM (Rejected)**: Violates the strict *"It has one tool: web search"* constraint and wastes an extra LLM roundtrip (+1.5s latency and +1 RPM) before web searching can even begin.
-2. **Cloud Embedding APIs for Memory (Rejected)**: Calling remote embedding endpoints on every message consumes rate-limit quota and adds network latency. Running quantized **IBM Granite R2 ONNX** locally in Node.js takes ~12ms on CPU with <150MB RAM.
-3. **Heavy Agent Frameworks like LangChain/LlamaIndex (Rejected)**: Hide prompt assembly and tool-loop control behind opaque abstractions. A 120-line native TypeScript loop over the OpenAI-compatible SDK is faster to debug, streams granular telemetry (`memory` → `search_start` → `search_complete` → `answer`), and has zero dependency bloat.
-
----
-
-## 4. What We Would Build With Another Week
-
-1. **Token-Level Streaming Over Server-Sent Events (SSE)**: Stream final synthesis tokens incrementally (`stream: true`) alongside tool-call delta chunks for sub-300ms time-to-first-token (TTFT).
-2. **Structured Fact & Price Ledger Table**: Extract structured `(entity, metric, value, as_of_date, source_url)` tuples into a dedicated SQLite table after every assistant turn for deterministic numeric diffing.
-3. **Playwright Headless Browser Fallback for JS-Heavy SPAs**: Some SaaS pricing pages render tier tables client-side; adding a lightweight headless browser fallback when Readability returns `<200` chars would achieve near-100% extraction coverage.
-4. **Automated Evaluation Harness (`npm run eval`)**: An LLM-as-a-judge test suite that seeds synthetic histories, runs 50 temporal + live-web verification prompts, and scores citation precision and latency.
-
----
+1. **Token-Level SSE Streaming with Incremental Citation Resolution**: Stream final synthesis tokens character-by-character (`stream: true`) while resolving `[N]` citation pills on the fly for sub-300ms time-to-first-token.
+2. **Structured Entity-Metric Fact Ledger**: Extract normalized `(entity, metric, value, as_of_date, source_url)` tuples into a dedicated SQLite table alongside conversational turns for deterministic numeric diffing.
+3. **Headless Browser Fallback for Client-Rendered Pricing SPAs**: Trigger a lightweight Playwright fallback when Readability extracts `<200` characters on JS-heavy SaaS pricing tables.
+4. **Automated Evaluation Harness (`npm run eval`)**: A deterministic test runner that seeds synthetic multi-day histories, executes 50 temporal + live-web verification queries, and scores citation accuracy and latency.
