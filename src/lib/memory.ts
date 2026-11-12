@@ -32,6 +32,13 @@ db.exec(`
   );
 `);
 
+export interface StoredSource {
+  title: string;
+  url: string;
+  query?: string;
+  provider?: string;
+}
+
 export interface StoredMessage {
   id: number;
   session_id: string;
@@ -42,12 +49,20 @@ export interface StoredMessage {
   matchReason?: string;
 }
 
+export interface ConsolidationResult {
+  action: "inserted" | "consolidated";
+  userRowId: number;
+  assistantRowId: number;
+  similarityScore?: number;
+  matchedQueryPreview?: string;
+}
+
 export async function saveMessage(params: {
   sessionId: string;
   role: "user" | "assistant";
   content: string;
-  sources?: any[];
-  createdAt?: string; // Supports backdating for testing temporal memory
+  sources?: StoredSource[];
+  createdAt?: string;
 }): Promise<StoredMessage> {
   const createdAt = params.createdAt || new Date().toISOString();
   const embedding = await embedText(params.content);
@@ -83,6 +98,223 @@ export async function saveMessage(params: {
 }
 
 /**
+ * Normalize text for fast token-Jaccard intent comparison alongside Granite-R2 cosine similarity.
+ */
+function computeTokenOverlap(a: string, b: string): number {
+  const tokenize = (s: string) =>
+    new Set(
+      s
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, " ")
+        .split(/\s+/)
+        .filter((w) => w.length > 2)
+    );
+  const setA = tokenize(a);
+  const setB = tokenize(b);
+  if (setA.size === 0 || setB.size === 0) return 0;
+  let intersection = 0;
+  for (const w of setA) {
+    if (setB.has(w)) intersection++;
+  }
+  return intersection / Math.min(setA.size, setB.size);
+}
+
+/**
+ * Smart Semantic Memory Consolidation (Upsert vs Insert):
+ * Checks if a semantically equivalent or paraphrased user prompt already exists
+ * within the same date window (or non-seed history).
+ * - If cosine similarity >= 0.83 (or hybrid similarity + token overlap >= 0.80),
+ *   it updates the existing User + Assistant pair in-place instead of creating duplicates!
+ * - Never overwrites protected historical seed anchors on past dates when asked from today.
+ */
+export async function consolidateOrSaveTurn(params: {
+  sessionId: string;
+  userContent: string;
+  assistantContent: string;
+  sources?: StoredSource[];
+  createdAt?: string;
+}): Promise<ConsolidationResult> {
+  const createdAt = params.createdAt || new Date().toISOString();
+  const targetDay = createdAt.split("T")[0];
+  const userVec = await embedText(params.userContent);
+
+  // Pull existing user turns to check for same/similar intent
+  const existingUsers = db
+    .prepare(
+      `SELECT id, session_id, role, content, embedding_json, created_at
+       FROM messages
+       WHERE role = 'user'
+       ORDER BY created_at DESC
+       LIMIT 150`
+    )
+    .all() as (StoredMessage & { embedding_json: string })[];
+
+  let bestMatch: {
+    row: StoredMessage & { embedding_json: string };
+    score: number;
+  } | null = null;
+
+  for (const candidate of existingUsers) {
+    const candidateDay = candidate.created_at.split("T")[0];
+
+    // Protect historical baseline seeds on DIFFERENT dates from being overwritten by today's follow-up
+    const isProtectedPastSeed =
+      candidate.session_id.startsWith("seed-") && candidateDay !== targetDay;
+    if (isProtectedPastSeed) continue;
+
+    // Only consolidate turns from the same day OR non-dated general queries
+    const sameDay = candidateDay === targetDay;
+    if (!sameDay) continue;
+
+    const candVec = JSON.parse(candidate.embedding_json || "[]") as number[];
+    const cosSim =
+      userVec.length && candVec.length
+        ? cosineSimilarity(userVec, candVec)
+        : 0;
+    const tokenOverlap = computeTokenOverlap(
+      params.userContent,
+      candidate.content
+    );
+
+    // Hybrid semantic + lexical intent score
+    const combinedScore = Math.max(
+      cosSim,
+      cosSim * 0.7 + tokenOverlap * 0.3
+    );
+
+    if (
+      combinedScore >= 0.82 &&
+      (!bestMatch || combinedScore > bestMatch.score)
+    ) {
+      bestMatch = { row: candidate, score: combinedScore };
+    }
+  }
+
+  // If we found an existing memory with the same/similar intent -> CONSOLIDATE IN PLACE!
+  if (bestMatch) {
+    const existingUserId = bestMatch.row.id;
+
+    // Update user turn timestamp & latest phrasing
+    await updateMessage({
+      id: existingUserId,
+      role: "user",
+      content: params.userContent,
+      createdAt,
+    });
+
+    // Find the paired assistant turn right after existingUserId
+    const pairedAssistant = db
+      .prepare(
+        `SELECT id FROM messages
+         WHERE id > ? AND role = 'assistant'
+         ORDER BY id ASC
+         LIMIT 1`
+      )
+      .get(existingUserId) as { id: number } | undefined;
+
+    let assistantRowId = existingUserId + 1;
+    const replyTimestamp = new Date(
+      new Date(createdAt).getTime() + 1000
+    ).toISOString();
+
+    if (pairedAssistant) {
+      assistantRowId = pairedAssistant.id;
+      const replyVec = await embedText(params.assistantContent);
+      db.prepare(
+        `UPDATE messages
+         SET content = ?, sources_json = ?, embedding_json = ?, created_at = ?
+         WHERE id = ?`
+      ).run(
+        params.assistantContent,
+        JSON.stringify(params.sources || []),
+        JSON.stringify(replyVec),
+        replyTimestamp,
+        assistantRowId
+      );
+      db.prepare(`DELETE FROM messages_fts WHERE rowid = ?`).run(
+        assistantRowId
+      );
+      db.prepare(`INSERT INTO messages_fts(rowid, content) VALUES (?, ?)`).run(
+        assistantRowId,
+        params.assistantContent
+      );
+    } else {
+      const savedReply = await saveMessage({
+        sessionId: params.sessionId,
+        role: "assistant",
+        content: params.assistantContent,
+        sources: params.sources,
+        createdAt: replyTimestamp,
+      });
+      assistantRowId = savedReply.id;
+    }
+
+    return {
+      action: "consolidated",
+      userRowId: existingUserId,
+      assistantRowId,
+      similarityScore: Number((bestMatch.score * 100).toFixed(1)),
+      matchedQueryPreview: bestMatch.row.content.slice(0, 80),
+    };
+  }
+
+  // Otherwise, insert as a brand-new memory pair
+  const savedUser = await saveMessage({
+    sessionId: params.sessionId,
+    role: "user",
+    content: params.userContent,
+    createdAt,
+  });
+
+  const savedAssistant = await saveMessage({
+    sessionId: params.sessionId,
+    role: "assistant",
+    content: params.assistantContent,
+    sources: params.sources,
+    createdAt: new Date(new Date(createdAt).getTime() + 1000).toISOString(),
+  });
+
+  return {
+    action: "inserted",
+    userRowId: savedUser.id,
+    assistantRowId: savedAssistant.id,
+  };
+}
+
+export async function updateMessage(params: {
+  id: number;
+  role: "user" | "assistant";
+  content: string;
+  createdAt: string;
+}): Promise<void> {
+  const embedding = await embedText(params.content);
+
+  db.prepare(
+    `UPDATE messages
+     SET role = ?, content = ?, embedding_json = ?, created_at = ?
+     WHERE id = ?`
+  ).run(
+    params.role,
+    params.content,
+    JSON.stringify(embedding),
+    params.createdAt,
+    params.id
+  );
+
+  // Sync FTS5 index
+  db.prepare(`DELETE FROM messages_fts WHERE rowid = ?`).run(params.id);
+  db.prepare(`INSERT INTO messages_fts(rowid, content) VALUES (?, ?)`).run(
+    params.id,
+    params.content
+  );
+}
+
+export function deleteMessageById(id: number): void {
+  db.prepare(`DELETE FROM messages WHERE id = ?`).run(id);
+  db.prepare(`DELETE FROM messages_fts WHERE rowid = ?`).run(id);
+}
+
+/**
  * 3-Layer Hybrid Episodic Memory Retrieval:
  * 1. Temporal Layer (chrono-node parses "Monday", "3 November", "Last Tuesday")
  * 2. Lexical Layer (SQLite FTS5 BM25 keyword match)
@@ -93,7 +325,10 @@ export async function retrieveEpisodicMemory(
   referenceNow: Date = new Date()
 ): Promise<{ memories: StoredMessage[]; telemetry: string[] }> {
   const telemetry: string[] = [];
-  const scoredMap = new Map<number, { msg: StoredMessage; score: number; reasons: Set<string> }>();
+  const scoredMap = new Map<
+    number,
+    { msg: StoredMessage; score: number; reasons: Set<string> }
+  >();
 
   const addCandidate = (msg: StoredMessage, score: number, reason: string) => {
     const existing = scoredMap.get(msg.id);
@@ -106,7 +341,9 @@ export async function retrieveEpisodicMemory(
   };
 
   // LAYER 1: Temporal Date Extraction (chrono-node)
-  const parsedDates = chrono.parse(userQuery, referenceNow, { forwardDate: false });
+  const parsedDates = chrono.parse(userQuery, referenceNow, {
+    forwardDate: false,
+  });
   for (const parsed of parsedDates) {
     const targetDate = parsed.start.date();
     const dayStart = new Date(targetDate);
@@ -199,7 +436,6 @@ export async function retrieveEpisodicMemory(
 
     for (const item of vecScored) {
       addCandidate(item.row, item.sim * 5.0, `Vector Sim (${item.sim.toFixed(2)})`);
-      // Also pull the adjacent assistant response if a user question matched
       const nextTurn = db
         .prepare(
           `SELECT id, session_id, role, content, sources_json, created_at
@@ -225,12 +461,12 @@ export async function retrieveEpisodicMemory(
   return { memories: ranked, telemetry };
 }
 
-export function getAllMessages(limit = 100): StoredMessage[] {
+export function getAllMessages(limit = 200): StoredMessage[] {
   return db
     .prepare(
       `SELECT id, session_id, role, content, sources_json, created_at
        FROM messages
-       ORDER BY created_at ASC
+       ORDER BY created_at ASC, id ASC
        LIMIT ?`
     )
     .all(limit) as StoredMessage[];
