@@ -13,6 +13,17 @@ export interface SearchResultItem {
   provider: "tavily" | "zero-key-sift";
 }
 
+interface TavilyResultRaw {
+  title?: string;
+  url: string;
+  content?: string;
+  published_date?: string;
+}
+
+interface TavilyApiResponse {
+  results?: TavilyResultRaw[];
+}
+
 const turndown = new TurndownService({
   headingStyle: "atx",
   codeBlockStyle: "fenced",
@@ -48,9 +59,9 @@ async function scrapePageToMarkdown(url: string, timeoutMs = 4500): Promise<stri
     // Strip noisy tags before Readability
     document
       .querySelectorAll("script, style, noscript, nav, footer, iframe, svg")
-      .forEach((el: any) => el.remove());
+      .forEach((el: Element) => el.remove());
 
-    const reader = new Readability(document as any);
+    const reader = new Readability(document as unknown as Document);
     const article = reader.parse();
 
     if (!article || !article.content) return "";
@@ -89,8 +100,8 @@ async function searchViaTavily(
     throw new Error(`Tavily HTTP ${res.status}`);
   }
 
-  const data = await res.json();
-  return (data.results || []).map((r: any) => ({
+  const data = (await res.json()) as TavilyApiResponse;
+  return (data.results || []).map((r) => ({
     query,
     title: r.title || "Untitled",
     url: r.url,
@@ -137,7 +148,7 @@ async function searchViaZeroKey(
       );
 
       rawItems = nodes
-        .map((node: any) => {
+        .map((node: Element) => {
           const titleEl = node.querySelector(".result__a");
           const snippetEl = node.querySelector(".result__snippet");
           let href = titleEl?.getAttribute("href") || "";
@@ -182,10 +193,9 @@ export async function executeParallelWebSearch(
   queries: string[],
   maxResultsPerQuery = 3
 ): Promise<{ results: SearchResultItem[]; providerUsed: string }> {
-  const uniqueQueries = Array.from(new Set(queries.map((q) => q.trim()).filter(Boolean))).slice(
-    0,
-    6
-  );
+  const uniqueQueries = Array.from(
+    new Set(queries.map((q) => q.trim()).filter(Boolean))
+  ).slice(0, 6);
 
   let providerUsed = process.env.TAVILY_API_KEY?.trim()
     ? "Tavily API"
@@ -196,8 +206,11 @@ export async function executeParallelWebSearch(
       if (process.env.TAVILY_API_KEY?.trim()) {
         try {
           return await searchViaTavily(q, maxResultsPerQuery);
-        } catch (err) {
-          console.warn(`Tavily failed for "${q}", falling back to Zero-Key scraper:`, err);
+        } catch (err: unknown) {
+          console.warn(
+            `Tavily failed for "${q}", falling back to Zero-Key scraper:`,
+            err
+          );
           providerUsed = "Zero-Key Fallback (DDG + Readability)";
         }
       }
